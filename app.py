@@ -37,7 +37,7 @@ print("[INIT] Setting up Azure OpenAI client...")
 model_client = AzureOpenAIChatCompletionClient(
     azure_endpoint=os.getenv("AZURE_ENDPOINT"),
     azure_deployment=os.getenv("MODEL_DEPLOYMENT_NAME"),
-    model="gpt-4o",
+    model="gpt-4o-2024-11-20",
     api_version=os.getenv("MODEL_API_VERSION"),
 )
 
