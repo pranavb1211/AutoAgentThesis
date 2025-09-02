@@ -90,7 +90,7 @@ async def create_news_agent(stock_symbol: str):
         name="NewsAnalyzer",
         description=f"Summarizes recent {stock_symbol}-related news with citations using Bing search.",
         project_client=project_client,
-        deployment_name="gpt-4o",
+        deployment_name="gpt-4o-2024-11-20",
         instructions=(
             f"You are the NewsAnalyzer. You MUST use the Bing search tool provided "
             f"to find the most relevant news about {stock_symbol} from the last 90 days. "
@@ -238,8 +238,9 @@ def fetch_yfinance_data(stock_symbol: str) -> str:
         return f"❌ Error fetching yfinance data for {stock_symbol}: {e}"
 
 
-async def yfinance_agent_tool(stock_name: str) -> str:
-    return fetch_yfinance_data(stock_name)
+async def yfinance_agent_tool(ticker: str) -> str:
+    return fetch_yfinance_data(ticker)
+
 
 
 # ---- FinGPT core tool (async) ----
@@ -281,13 +282,14 @@ financials_agent_assistant = AssistantAgent(
 
 # ---- SummaryCombiner factory (captures horizon_days) ----
 def make_summary_combiner(horizon_days: int) -> AssistantAgent:
-    async def call_fingpt(stock_name: str, context: str):
-        return await fingpt_analysis_tool(stock_name, context, horizon_days)
+    async def fingpt_analysis_tool(stock_name: str, context: str):
+        # keep the SAME signature you promised in the instruction
+        return await fingpt_analysis_tool_runner(stock_name, context, horizon_days)
 
     return AssistantAgent(
         name="SummaryCombiner",
         model_client=model_client,
-        tools=[call_fingpt],
+        tools=[fingpt_analysis_tool],  # tool name now matches instruction
         system_message=(
             "You are the SummaryCombiner. Before taking any action, read the chat history "
             "and locate the most recent full message from 'NewsAnalyzer' and the most recent full message "
@@ -295,10 +297,15 @@ def make_summary_combiner(horizon_days: int) -> AssistantAgent:
             "Step 1: Extract their entire contents without omission.\n"
             "Step 2: Build the context as:\n"
             "'NEWS:\n<NewsAnalyzer content>\n\nFINANCIALS:\n<financials_agent content>'\n"
-            f"Step 3: Call `fingpt_analysis_tool(stock_name=<TICKER>, context=<that context>, horizon_days={horizon_days})`.\n"
+            f"Step 3: Call `fingpt_analysis_tool(stock_name=<TICKER>, context=<that context>)`.\n"
             "Do not forecast yourself."
         ),
     )
+
+# keep your actual runner separate to pass horizon_days cleanly
+async def fingpt_analysis_tool_runner(stock_name: str, context: str, horizon_days: int) -> str:
+    return await fingpt_analysis_tool(stock_name, context, horizon_days)
+
 
 
 decision_agent = AssistantAgent(
