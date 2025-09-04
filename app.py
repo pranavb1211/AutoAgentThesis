@@ -90,7 +90,7 @@ async def create_news_agent(stock_symbol: str):
         name="NewsAnalyzer",
         description=f"Summarizes recent {stock_symbol}-related news with citations using Bing search.",
         project_client=project_client,
-        deployment_name="gpt-4o-2024-11-20",
+        deployment_name="gpt-4o",
         instructions=(
             f"You are the NewsAnalyzer. You MUST use the Bing search tool provided "
             f"to find the most relevant news about {stock_symbol} from the last 90 days. "
