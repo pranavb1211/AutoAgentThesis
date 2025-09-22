@@ -2,6 +2,7 @@
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import StoppingCriteria, StoppingCriteriaList
 from peft import PeftModel
 from dotenv import load_dotenv
 
@@ -10,7 +11,7 @@ load_dotenv()
 
 # --- Set your paths here or via env vars ---
 BASE_MODEL_DIR = os.getenv("FINGPT_BASE_DIR", r"C:\hf\models\llama2-7b-chat")
-LORA_DIR       = os.getenv("FINGPT_LORA_DIR", r"C:\hf\models\fingpt_adapter")  # or HF repo id like "FinGPT/…"
+LORA_DIR       = os.getenv("FINGPT_LORA_DIR", r"C:\hf\models\fingpt_adapter")
 
 # Singletons
 _tokenizer = None
@@ -30,10 +31,11 @@ def _ensure_paths():
                 f"LoRA folder {LORA_DIR} has no adapter files. "
                 "Download the FinGPT adapter or point FINGPT_LORA_DIR to its HF repo id."
             )
-    # If LORA_DIR is an HF id (string), that's fine — no local check.
+    # If LORA_DIR is an HF repo id string, skip local check.
 
 
 def _load_once():
+    """Load tokenizer + base + LoRA once into globals."""
     global _tokenizer, _model
     if _model is not None:
         return
@@ -50,11 +52,11 @@ def _load_once():
     if _tokenizer.pad_token_id is None and _tokenizer.eos_token_id is not None:
         _tokenizer.pad_token = _tokenizer.eos_token
 
-    # Base model (local only). Use GPU if available.
+    # Base model (local only)
     base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_DIR,
         local_files_only=True,
-        dtype=dtype,                 # <— modern kwarg
+        dtype=dtype,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
         use_safetensors=True,
@@ -68,7 +70,7 @@ def _load_once():
     else:
         model = PeftModel.from_pretrained(base, LORA_DIR)
 
-    # Optional: merge LoRA to slightly reduce VRAM; ignore if not supported
+    # Optional merge to reduce VRAM; skip if not supported
     try:
         model = model.merge_and_unload()
     except Exception:
@@ -78,39 +80,94 @@ def _load_once():
     _model = model
 
 
+class _BraceStop(StoppingCriteria):
+    """Stop when we've produced a balanced JSON object after the anchored '{'."""
+    def __init__(self, tokenizer, start_len: int):
+        self.tok = tokenizer
+        self.start_len = start_len  # input length (tokens) before generation
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        # Decode only the generated part
+        gen_ids = input_ids[0, self.start_len:]
+        text = self.tok.decode(gen_ids, skip_special_tokens=True)
+        opens = text.count("{")
+        closes = text.count("}")
+        # When the first JSON object is fully closed, closes >= opens and > 0
+        return closes >= opens and closes > 0
+
+
 def your_fingpt_analyze_function(
     prompt: str,
-    max_new_tokens: int = 128,
-    temperature: float = 0.3,
-    top_p: float = 0.9,
+    max_new_tokens: int = 360,
+    do_sample: bool = False,   # greedy first for stable schema
+    temperature: float = 0.2,  # used only if do_sample=True (or in fallback)
+    top_p: float = 1.0,
 ) -> str:
-    """Generate a short continuation with FinGPT-adapted LLaMA2."""
+    """
+    Generate continuation with FinGPT-adapted LLaMA2, anchored to JSON.
+    - Greedy first (stable).
+    - Balanced-brace stopping to avoid mid-object truncation.
+    - Automatic fallback to light sampling with bigger budget if incomplete.
+    """
     _load_once()
 
-    inputs = _tokenizer(prompt, return_tensors="pt")
-    # Move tensors to same device as model
+    # Anchor the reply to start inside JSON
+    anchored_prompt = (
+        prompt.strip()
+        + "\n\nOutput VALID JSON (double-quoted keys and string values). "
+          "Begin exactly with the brace below and continue the JSON:\n{"
+    )
+
+    inputs = _tokenizer(anchored_prompt, return_tensors="pt")
     device = next(_model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
     input_len = inputs["input_ids"].shape[1]
 
-    with torch.no_grad():
-        out = _model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min(16, max_new_tokens),   # force a bit of continuation
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
+    stop = StoppingCriteriaList([_BraceStop(_tokenizer, input_len)])
+
+    def _gen(sample: bool, maxtoks: int):
+        gen_kwargs = dict(
+            max_new_tokens=maxtoks,
+            min_new_tokens=min(96, maxtoks),
             no_repeat_ngram_size=3,
             pad_token_id=_tokenizer.pad_token_id,
             eos_token_id=_tokenizer.eos_token_id,
             use_cache=True,
+            stopping_criteria=stop,
         )
+        if sample:
+            gen_kwargs.update(dict(do_sample=True, temperature=temperature, top_p=top_p))
+        else:
+            gen_kwargs.update(dict(do_sample=False))
+        with torch.no_grad():
+            return _model.generate(**inputs, **gen_kwargs)
 
-    # Decode only the continuation (exclude the prompt)
+    # Pass 1: greedy
+    out = _gen(sample=False, maxtoks=max_new_tokens)
     cont_ids = out[0][input_len:]
-    text = _tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
-    return text or _tokenizer.decode(out[0], skip_special_tokens=True)
+    cont_text = _tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
+    text = "{" + cont_text  # reattach the anchored brace
+
+    # Trim to the first complete JSON object
+    s = text.find("{")
+    e = text.rfind("}")
+    complete = (s != -1 and e != -1 and e > s)
+    has_verdict = ("\"verdict\"" in text or "'verdict'" in text)
+
+    # Fallback if needed
+    if not complete or not has_verdict:
+        out = _gen(sample=True, maxtoks=max_new_tokens + 200)
+        cont_ids = out[0][input_len:]
+        cont_text = _tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
+        text = "{" + cont_text
+        s = text.find("{")
+        e = text.rfind("}")
+
+    # Final hard trim
+    if s != -1 and e != -1 and e > s:
+        text = text[s:e+1]
+
+    return text
 
 
 # Tiny CLI: python -m adapters.fingpt_local "your prompt"
@@ -118,12 +175,14 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("prompt", nargs="?", default="Give a one-sentence market outlook for the Dow Jones today.")
-    p.add_argument("--max-new-tokens", type=int, default=64)
-    p.add_argument("--temperature", type=float, default=0.3)
-    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--max-new-tokens", type=int, default=360)
+    p.add_argument("--do-sample", action="store_true", help="Use sampling instead of greedy decoding")
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("--top-p", type=float, default=1.0)
     a = p.parse_args()
     print(
         your_fingpt_analyze_function(
-            a.prompt, max_new_tokens=a.max_new_tokens, temperature=a.temperature, top_p=a.top_p
+            a.prompt, max_new_tokens=a.max_new_tokens,
+            do_sample=a.do_sample, temperature=a.temperature, top_p=a.top_p
         )
     )
