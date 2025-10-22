@@ -27,6 +27,9 @@ from autogen_ext.agents.azure._azure_ai_agent import AzureAIAgent
 # Local FinGPT adapter (sync function)
 from adapters.fingpt_local import your_fingpt_analyze_function
 
+# MCP Runner (for local model serving, if needed)
+from mcprunner import MCPStdIOClient 
+
 
 # ============ Bootstrap ============
 print("[INIT] Loading environment variables...")
@@ -321,7 +324,48 @@ async def run_app(stock_symbol: str, horizon_days: int):
             mode="live",
         )
         print(f"[LOG] Prediction appended to {PREDICTION_LOG}")
+        # ======================================================
+        #  Slack MCP Notification
+        # ======================================================
+        try:
+            from mcprunner import MCPStdIOClient  # reuse the working implementation
+            REGISTRY_PATH = r"C:\mcpCnfig\slack.json"
+            SLACK_CHANNEL_ID = "C09D8UXSDLL"
 
+            print("\n[SLACK] Sending SummaryCombiner result to Slack...")
+            mcp_client = MCPStdIOClient(REGISTRY_PATH)
+            await mcp_client.ensure_started("slack")
+
+            # Post the SummaryCombiner output or DecisionAgent text
+            summary_text = ""
+            if final:
+                summary_text = final.content
+            elif hasattr(result, "messages"):
+                msg = next((m for m in reversed(result.messages)
+                            if m.source == "SummaryCombiner"), None)
+                if msg:
+                    summary_text = msg.content
+
+            if not summary_text:
+                summary_text = f"No summary found for {stock_symbol}"
+
+            payload = f"📊 Summary for {stock_symbol} ({horizon_days}-day horizon):\n\n{summary_text}"
+            resp = await mcp_client.call(
+                "slack",
+                "conversations_add_message",
+                {"channel_id": SLACK_CHANNEL_ID, "payload": payload}
+            )
+
+            print("[SLACK] Response:", resp)
+            await mcp_client.close()
+            print("[SLACK] ✅ Notification sent.")
+        except Exception as e:
+            print(f"[SLACK] ❌ Failed to post to Slack: {e}")
+
+        # TODO : Listen to slack reply and trigger buy/sell via Alpaca API
+        # Can we send slack cards with buttons for Buy/Sell/Hold?
+        # We will listen to the replies and trigger the Alpaca MCP accordingly
+        # ======================================================    
         print("\n=== DEBUG: Agent outputs before SummaryCombiner (recap) ===")
         for msg in result.messages:
             if msg.source in ("NewsAnalyzer", "financials_agent"):
