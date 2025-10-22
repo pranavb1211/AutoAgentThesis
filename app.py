@@ -329,7 +329,7 @@ async def run_app(stock_symbol: str, horizon_days: int):
         # ======================================================
         try:
             from mcprunner import MCPStdIOClient  # reuse the working implementation
-            REGISTRY_PATH = r"C:\mcpCnfig\slack.json"
+            REGISTRY_PATH = r"C:\mcpCnfig\mcpServerList.json"
             SLACK_CHANNEL_ID = "C09D8UXSDLL"
 
             print("\n[SLACK] Sending SummaryCombiner result to Slack...")
