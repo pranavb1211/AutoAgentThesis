@@ -1,6 +1,6 @@
-# AutoAgentThesis
+# A Cloud-Based Real-Time Conversational System for Autonomous Financial Analysis and Stock Trading Using LLM Agents and MCP.
 
-A Cloud-Based Real-Time Conversational System for Autonomous Financial Analysis and Stock Trading Using LLM Agents and MCP
+A Slack-Integrated Multi-Agent Architecture Combining Azure GPT-4o, FinGPT, and Alpaca MCP for Real-Time Stock Market Automation
 
 A multi-agent stock analysis system that combines:
 
