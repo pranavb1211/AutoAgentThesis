@@ -1,5 +1,7 @@
 # AutoAgentThesis
 
+A Cloud-Based Real-Time Conversational System for Autonomous Financial Analysis and Stock Trading Using LLM Agents and MCP
+
 A multi-agent stock analysis system that combines:
 
 - **Azure OpenAI (GPT-4o)** for reasoning & orchestration  
