@@ -1,6 +1,6 @@
 # A Cloud-Based Conversational System for Real-Time Financial Analysis and Stock Trade Execution Using Autonomous AI Agents Orchestrated via the Model Context Protocol (MCP)
 
-A Slack-Integrated Multi-Agent Architecture Combining Azure GPT-4o, FinGPT, and Alpaca MCP for Real-Time Stock Market Automation
+A Slack-Integrated Multi-Agent Architecture Combining Azure GPT-4o, FinGPT, Slack MCP server and Alpaca MCP server for Real-Time Stock Market Automation
 
 A multi-agent stock analysis system that combines:
 
