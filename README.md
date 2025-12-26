@@ -11,6 +11,7 @@ A multi-agent stock analysis system that combines:
 - **Bing Grounding Tool** for real news search  
 - **yfinance** for market data  
 - **Local FinGPT adapter (LLaMA-2 + LoRA)** for short-term trend forecasting  
+<img width="1987" height="2705" alt="Untitled diagram-2025-11-30-161432" src="https://github.com/user-attachments/assets/e5245736-6af7-45bb-8200-08eded7b21ff" />
 
 The system runs a round-robin agent team to gather news, fetch financials, forecast trends, and make structured Buy/Sell/Hold decisions.
 
