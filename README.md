@@ -1,4 +1,9 @@
-# AutoAgentThesis
+# A Cloud-Based Conversational System for Real-Time Financial Analysis and Stock Trade Execution Using Autonomous AI Agents Orchestrated via the Model Context Protocol (MCP)
+
+This thesis presents the design and implementation of an autonomous cloud based conversational system for real time financial analysis of a specific stock and human supervised stock trade execution based on the results of that analysis. The system combines cloud hosted and locally run artificial intelligence components to analyse market data, interpret news sentiment, forecast short-term trends, and propose as well as execute trading actions, all orchestrated through the Model Context Protocol (MCP). The architecture emphasizes modularity,availability and safe human-in-the-loop supervision so that final trade decisions remain under explicit user control.
+The system leverages Autogen for multi agent coordination, Azure OpenAI’s GPT-4o for natural-language reasoning , FinGPT (a LLaMA-2 model fine-tuned with LoRA adapters) for short-horizon financial trend forecasting, the Bing Grounding Tool for retrieving timely market moving news, and yfinance for essential technical indicators. These components operate within an orchestrated agent pipeline in which specialized agents independently handle news extraction, financial metric computation, trend analysis, decision synthesis and communicate insights to the end user via Slack. The Slack component provides the users with a conversational interface to the trading platform, i.e. Alpaca, which subsequently retrieves or executes real time market orders according to the user’s messages. 
+This integration is a classical demonstration of how agentic AI architectures can bridge cloud services, local computational resources,communication channels such as Slack, and trading platforms such as Alpaca into a cohesive and extensible platform capable of informed decision making and the automated execution and retrieval of trades, positions, and other brokerage data.
+
 
 A multi-agent stock analysis system that combines:
 
@@ -6,6 +11,7 @@ A multi-agent stock analysis system that combines:
 - **Bing Grounding Tool** for real news search  
 - **yfinance** for market data  
 - **Local FinGPT adapter (LLaMA-2 + LoRA)** for short-term trend forecasting  
+<img width="1987" height="2705" alt="Untitled diagram-2025-11-30-161432" src="https://github.com/user-attachments/assets/e5245736-6af7-45bb-8200-08eded7b21ff" />
 
 The system runs a round-robin agent team to gather news, fetch financials, forecast trends, and make structured Buy/Sell/Hold decisions.
 
