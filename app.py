@@ -4,12 +4,12 @@ import asyncio
 import math
 import json
 import uuid
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 import numpy as np
-import pandas as pd
 import yfinance as yf
 
 from autogen_agentchat.agents import AssistantAgent
@@ -27,8 +27,8 @@ from autogen_ext.agents.azure._azure_ai_agent import AzureAIAgent
 # Local FinGPT adapter (sync function)
 from adapters.fingpt_local import your_fingpt_analyze_function
 
-# MCP Runner (for local model serving, if needed)
-from mcprunner import MCPStdIOClient 
+# MCP Runner
+from mcprunner import MCPStdIOClient
 
 
 # ============ Bootstrap ============
@@ -36,11 +36,23 @@ print("[INIT] Loading environment variables...")
 load_dotenv()
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
-# ============ JSONL Logger ============
-PREDICTION_LOG = Path("predictions.jsonl")
 
-def log_prediction(*, ticker, as_of_date, horizon_days, decision_text,
-                   news=None, financials=None, grounded=True, mode="live"):
+# ============ JSONL Loggers ============
+PREDICTION_LOG = Path("predictions.jsonl")
+SYSTEM_TIMINGS_LOG = Path("system_timings.jsonl")
+
+
+def log_prediction(
+    *,
+    ticker,
+    as_of_date,
+    horizon_days,
+    decision_text,
+    news=None,
+    financials=None,
+    grounded=True,
+    mode="live",
+):
     rec = {
         "timestamp": datetime.utcnow().isoformat(),
         "mode": mode,
@@ -56,6 +68,55 @@ def log_prediction(*, ticker, as_of_date, horizon_days, decision_text,
     PREDICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
     with PREDICTION_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def append_system_timings(timings: dict):
+    SYSTEM_TIMINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with SYSTEM_TIMINGS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(timings, ensure_ascii=False) + "\n")
+
+
+# ============ Timing instrumentation ============
+def _wrap_agent_timing(agent, timings: dict, key: str):
+    """
+    Robustly wraps agent.on_messages (and optionally on_messages_stream) to measure
+    time spent inside the agent turn.
+
+    This DOES NOT rely on RoundRobin hooks, so you get stage_* even if on_message isn't called.
+    """
+    # on_messages (most common in autogen-agentchat)
+    if hasattr(agent, "on_messages"):
+        orig = agent.on_messages
+
+        async def timed_on_messages(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return await orig(*args, **kwargs)
+            finally:
+                dt = time.perf_counter() - t0
+                # If multiple calls happen (rare), keep the first stage time and also keep total
+                if timings.get(key) is None:
+                    timings[key] = dt
+                timings[key + "_total"] = timings.get(key + "_total", 0.0) + dt
+
+        agent.on_messages = timed_on_messages  # monkeypatch
+
+    # on_messages_stream (some versions may stream)
+    if hasattr(agent, "on_messages_stream"):
+        origs = agent.on_messages_stream
+
+        async def timed_on_messages_stream(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                async for chunk in origs(*args, **kwargs):
+                    yield chunk
+            finally:
+                dt = time.perf_counter() - t0
+                if timings.get(key) is None:
+                    timings[key] = dt
+                timings[key + "_total"] = timings.get(key + "_total", 0.0) + dt
+
+        agent.on_messages_stream = timed_on_messages_stream  # monkeypatch
 
 
 # ============ Agents + Tools ============
@@ -99,7 +160,10 @@ async def create_news_agent(stock_symbol: str) -> AzureAIAgent:
         tools=bing_tool.definitions,
         metadata={"source": "AzureAIAgent"},
     )
+
+    # store for cleanup
     setattr(agent, "_az_credential", credential)
+    setattr(agent, "_az_project_client", project_client)
     return agent
 
 
@@ -147,40 +211,46 @@ def fetch_min_fin_json(stock_symbol: str) -> str:
 
 
 async def yfinance_agent_tool(ticker: str) -> str:
-    # returns a JSON string with only the agreed fields
-    return fetch_min_fin_json(ticker)
+    t0 = time.perf_counter()
+    out = fetch_min_fin_json(ticker)
+    dt = time.perf_counter() - t0
+    print(f"[TIME] yfinance_agent_tool_sec = {dt:.2f}s")
+    return out
 
 
 # ---- FinGPT tool runner (async wrapper around local sync function) ----
 async def fingpt_analysis_tool_runner(stock_name: str, context: str, horizon_days: int) -> str:
+    # IMPORTANT: You said you're moving away from strict JSON.
+    # Use the same lightweight tag contract you benchmarked (stable and easy).
     prompt = f"""
 You are a short-horizon equity trend forecaster.
-Read the JSON blocks and produce a STRICT JSON response with this schema:
 
-{{
-  "ticker": "{stock_name}",
-  "horizon_days": {horizon_days},
-  "outlook": "bullish" | "bearish" | "neutral",
-  "confidence": 0.0-1.0,
-  "rationale": "2-3 short sentences using facts from the JSON only",
-  "verdict": "Buy" | "Hold" | "Sell"
-}}
+Read the JSON blocks in the context (NEWS_JSON and FIN_JSON).
+Then output a short forecast using ONLY facts from those JSON blocks.
+
+Output MUST include ALL fields using EXACT labels:
+
+TICKER: {stock_name}
+HORIZON_DAYS: {horizon_days}
+OUTLOOK: bullish|bearish|neutral
+CONFIDENCE: <number between 0.0 and 1.0>
+VERDICT: Buy|Hold|Sell
+RATIONALE: <2-3 short sentences using facts from the JSON only>
 
 Rules:
-- Output valid JSON with double quotes around all keys and string values.
-- Confidence must be a floating-point number between 0.0 and 1.0.
-- Base your reasoning ONLY on the provided JSON.
-- No extra fields. No prose outside JSON. Be concise.
+- Use ONLY the provided JSON content. Do not invent facts.
+- Do NOT output JSON.
+- Do NOT use markdown or bullet points.
 
 Context:
 {context}
 """.strip()
 
-    # Greedy (stable schema), ample budget (your fingpt_local anchors/brace-stops)
+    # Greedy (deterministic). DO NOT pass temperature=0.0 anywhere.
     return your_fingpt_analyze_function(
         prompt,
-        max_new_tokens=360,
-        do_sample=False,   # IMPORTANT: greedy
+        max_new_tokens=220,
+        do_sample=False,   # greedy
     )
 
 
@@ -210,9 +280,14 @@ def make_financials_agent(model_client: AzureOpenAIChatCompletionClient) -> Assi
 
 
 # ---- SummaryCombiner (wires in FinGPT tool) ----
-def make_summary_combiner(model_client: AzureOpenAIChatCompletionClient, horizon_days: int) -> AssistantAgent:
+def make_summary_combiner(model_client: AzureOpenAIChatCompletionClient, horizon_days: int, timings: dict) -> AssistantAgent:
     async def fingpt_tool(stock_name: str, context: str) -> str:
-        return await fingpt_analysis_tool_runner(stock_name, context, horizon_days)
+        t0 = time.perf_counter()
+        out = await fingpt_analysis_tool_runner(stock_name, context, horizon_days)
+        dt = time.perf_counter() - t0
+        timings["stage_fingpt_sec"] = dt
+        print(f"[TIME] fingpt_infer_sec = {dt:.2f}s")
+        return out
 
     return AssistantAgent(
         name="SummaryCombiner",
@@ -246,27 +321,26 @@ def make_decision_agent(model_client: AzureOpenAIChatCompletionClient) -> Assist
     )
 
 
-# ---- Round-robin with logging ----
-class LoggingRoundRobinChat(RoundRobinGroupChat):
-    async def on_message(self, message, sender, receiver):
-        try:
-            sname = getattr(sender, "name", "")
-            content = getattr(message, "content", None)
-            if sname == "NewsAnalyzer":
-                print("\n[LOG] NewsAnalyzer returned:\n")
-                print(content if content is not None else message)
-                print("\n[END LOG]\n")
-            elif sname == "financials_agent":
-                print("\n[LOG] financials_agent returned:\n")
-                print(content if content is not None else message)
-                print("\n[END LOG]\n")
-        except Exception as e:
-            print(f"[WARN] Logging failed in on_message: {e}")
-        return await super().on_message(message, sender, receiver)
-
-
 # ============ Orchestration ============
 async def run_app(stock_symbol: str, horizon_days: int):
+    run_id = str(uuid.uuid4())
+    timings = {
+        "run_id": run_id,
+        "ticker": stock_symbol,
+        "horizon_days": int(horizon_days),
+        "pipeline_total_sec": None,
+        "stage_news_sec": None,
+        "stage_financials_sec": None,
+        "stage_fingpt_sec": None,     # set inside FinGPT tool wrapper (SummaryCombiner)
+        "stage_decision_sec": None,
+        # optional totals if agent gets called multiple times
+        "stage_news_sec_total": 0.0,
+        "stage_financials_sec_total": 0.0,
+        "stage_decision_sec_total": 0.0,
+    }
+
+    t_pipeline = time.perf_counter()
+
     print("[INIT] Setting up Azure OpenAI client...")
     model_client = AzureOpenAIChatCompletionClient(
         azure_endpoint=os.getenv("AZURE_ENDPOINT"),
@@ -277,15 +351,24 @@ async def run_app(stock_symbol: str, horizon_days: int):
 
     # Build agents
     print("[MAIN] Creating NewsAgent...")
+    t0 = time.perf_counter()
     news_agent = await create_news_agent(stock_symbol)
+    dt = time.perf_counter() - t0
+    print(f"[TIME] news_agent_setup_sec = {dt:.2f}s")
 
     print("[MAIN] Initializing team chat...")
     financials_agent = make_financials_agent(model_client)
-    summary_combiner = make_summary_combiner(model_client, horizon_days)
+    summary_combiner = make_summary_combiner(model_client, horizon_days, timings)
     decision_agent = make_decision_agent(model_client)
 
+    # --- THIS is the fix for your stage_* being 0/null:
+    # Instrument agents directly (does not rely on RoundRobin hooks).
+    _wrap_agent_timing(news_agent, timings, "stage_news_sec")
+    _wrap_agent_timing(financials_agent, timings, "stage_financials_sec")
+    _wrap_agent_timing(decision_agent, timings, "stage_decision_sec")
+
     text_termination = TextMentionTermination("Decision Made")
-    team = LoggingRoundRobinChat(
+    team = RoundRobinGroupChat(
         participants=[news_agent, financials_agent, summary_combiner, decision_agent],
         termination_condition=text_termination,
     )
@@ -301,8 +384,10 @@ async def run_app(stock_symbol: str, horizon_days: int):
         source="user",
     )
 
+    result = None
     try:
         result = await team.run(task=task)
+        timings["pipeline_total_sec"] = time.perf_counter() - t_pipeline
 
         print("\n🔍 Final Decision:\n")
         for msg in result.messages:
@@ -311,7 +396,7 @@ async def run_app(stock_symbol: str, horizon_days: int):
         # Persist record
         final = next((m for m in reversed(result.messages) if m.source == "DecisionAgent"), None)
         news_msg = next((m for m in reversed(result.messages) if m.source == "NewsAnalyzer"), None)
-        fin_msg  = next((m for m in reversed(result.messages) if m.source == "financials_agent"), None)
+        fin_msg = next((m for m in reversed(result.messages) if m.source == "financials_agent"), None)
 
         log_prediction(
             ticker=stock_symbol,
@@ -324,25 +409,27 @@ async def run_app(stock_symbol: str, horizon_days: int):
             mode="live",
         )
         print(f"[LOG] Prediction appended to {PREDICTION_LOG}")
+
+        # Write timings JSONL + print
+        append_system_timings(timings)
+        print("\n=== SYSTEM TIMINGS (sec) ===")
+        print(json.dumps(timings, indent=2))
+        print("=== END TIMINGS ===\n")
+
         # ======================================================
         #  Slack MCP Notification
         # ======================================================
         try:
-            from mcprunner import MCPStdIOClient  # reuse the working implementation
             REGISTRY_PATH = r"C:\mcpCnfig\mcpServerList.json"
             SLACK_CHANNEL_ID = "C09D8UXSDLL"
 
-            print("\n[SLACK] Sending SummaryCombiner result to Slack...")
+            print("\n[SLACK] Sending DecisionAgent output to Slack...")
             mcp_client = MCPStdIOClient(REGISTRY_PATH)
             await mcp_client.ensure_started("slack")
 
-            # Post the SummaryCombiner output or DecisionAgent text
-            summary_text = ""
-            if final:
-                summary_text = final.content
-            elif hasattr(result, "messages"):
-                msg = next((m for m in reversed(result.messages)
-                            if m.source == "SummaryCombiner"), None)
+            summary_text = final.content if final else ""
+            if not summary_text:
+                msg = next((m for m in reversed(result.messages) if m.source == "SummaryCombiner"), None)
                 if msg:
                     summary_text = msg.content
 
@@ -350,26 +437,21 @@ async def run_app(stock_symbol: str, horizon_days: int):
                 summary_text = f"No summary found for {stock_symbol}"
 
             payload = f"📊 Summary for {stock_symbol} ({horizon_days}-day horizon):\n\n{summary_text}"
+
+            t0 = time.perf_counter()
             resp = await mcp_client.call(
                 "slack",
                 "conversations_add_message",
-                {"channel_id": SLACK_CHANNEL_ID, "payload": payload}
+                {"channel_id": SLACK_CHANNEL_ID, "payload": payload},
             )
-
+            dt = time.perf_counter() - t0
+            print(f"[TIME] slack_post_sec = {dt:.2f}s")
             print("[SLACK] Response:", resp)
+
             await mcp_client.close()
             print("[SLACK] ✅ Notification sent.")
         except Exception as e:
             print(f"[SLACK] ❌ Failed to post to Slack: {e}")
-
-        # TODO : Listen to slack reply and trigger buy/sell via Alpaca API
-        # Can we send slack cards with buttons for Buy/Sell/Hold?
-        # We will listen to the replies and trigger the Alpaca MCP accordingly
-        # ======================================================    
-        print("\n=== DEBUG: Agent outputs before SummaryCombiner (recap) ===")
-        for msg in result.messages:
-            if msg.source in ("NewsAnalyzer", "financials_agent"):
-                print(f"\n--- {msg.source} ---\n{msg.content}\n")
 
     finally:
         # Clean up Azure OpenAI aiohttp session
@@ -382,11 +464,12 @@ async def run_app(stock_symbol: str, horizon_days: int):
 
         # Clean up Azure AI Project + credential used by NewsAnalyzer
         try:
-            pc = getattr(news_agent, "project_client", None)
+            pc = getattr(news_agent, "_az_project_client", None)
             if pc is not None and hasattr(pc, "close"):
                 await pc.close()
         except Exception:
             pass
+
         try:
             cred = getattr(news_agent, "_az_credential", None)
             if cred is not None and hasattr(cred, "close"):
