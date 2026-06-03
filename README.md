@@ -15,6 +15,8 @@ A multi-agent stock analysis system that combines:
 
 The system runs a round-robin agent team to gather news, fetch financials, forecast trends, and make structured Buy/Sell/Hold decisions.
 
+# The Azure hosted alpaca MCP server : [Alpaca trading platform MCP Server](https://github.com/pranavb1211/alpacaCloudMcpServer)
+
 ---
 
 ## ⚡ Recommended Setup (GPU + Local FinGPT Adapter)
